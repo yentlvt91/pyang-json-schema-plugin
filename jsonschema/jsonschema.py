@@ -140,9 +140,65 @@ def produce_type(type_stmt):
     else:
         logging.debug("Missing mapping of: %s %s",
                       type_stmt.keyword, type_stmt.arg, type_stmt.i_typedef)
-        type_str = {"type": "string"}
-    return type_str
+        type_str = {}
 
+    set_constraint(type_str, "pattern", get_constraint(type_stmt, "pattern"))
+    if get_constraint(type_stmt, "range") is not None or get_constraint(type_stmt, "length") is not None:
+        constraint = get_constraint(type_stmt, "range")
+        t = "range"
+        if constraint is None:
+            constraint = get_constraint(type_stmt, "length")
+            t = "length"
+        ranges = []
+        for c in constraint.split("|"):
+            if ".." in c:
+                start = gen_num(c.split("..")[0])
+                end = gen_num(c.split("..")[1])
+            else:
+                start = gen_num(c)
+                end = gen_num(c)
+
+            if ranges and start == ranges[-1][1] + 1:
+                ranges[-1][1] = end
+            else:
+                ranges.append([start, end])
+
+        if len(ranges) > 1:
+            # Generate a "anyOf" constraint
+            sub_type = type_str
+            type_str = {"anyOf": []}
+            for r in ranges:
+                # Normal range
+                new = dict(sub_type)
+                if sub_type["type"] in ["integer", "number"]:
+                    set_constraint(new, "minimum", ranges[0][0])
+                    set_constraint(new, "maximum", ranges[0][1])
+                elif sub_type["type"] == "string":
+                    set_constraint(new, "minLength", ranges[0][0])
+                    set_constraint(new, "maxLength", ranges[0][1])
+                else:
+                    logging.error("Range/length specified for unknown type at definition '%s'" % str(type_stmt))
+                for v in type_str["anyOf"]:
+                    if v == new:
+                        break
+                else:
+                    type_str["anyOf"].append(new)
+            if len(type_str["anyOf"]) == 1:
+                type_str = type_str["anyOf"][0]
+        else:
+            # Normal range
+            if type_str["type"] in ["integer", "number"]:
+                set_constraint(type_str, "minimum", ranges[0][0])
+                set_constraint(type_str, "maximum", ranges[0][1])
+            elif type_str["type"] == "string":
+                set_constraint(type_str, "minLength", ranges[0][0])
+                set_constraint(type_str, "maxLength", ranges[0][1])
+            else:
+                logging.error("Range/length specified for unknown type at definition '%s'" % str(type_stmt))
+
+    set_constraint(type_str, "description", get_constraint(type_stmt, "description"))
+
+    return type_str
 
 def produce_leaf(stmt):
     logging.debug("in produce_leaf: %s %s", stmt.keyword, stmt.arg)
@@ -151,28 +207,34 @@ def produce_leaf(stmt):
     type_stmt = stmt.search_one('type')
     type_str = produce_type(type_stmt)
 
+    set_constraint(type_str, "description", get_constraint(stmt, "description"))
+
     return {arg: type_str}
 
 def produce_list(stmt):
     logging.debug("in produce_list: %s %s", stmt.keyword, stmt.arg)
     arg = qualify_name(stmt)
 
-    if stmt.parent.keyword != "list":
-        result = {arg: {"type": "array", "items": []}}
-    else:
-        result = {"type": "object", "properties": {arg: {"type": "array", "items": []}}}
+    result = {arg: {"type": "array", "items": {}}}
+    set_constraint(result[arg], "maxItems", get_constraint(stmt, "max-elements"))
+    set_constraint(result[arg], "minItems", get_constraint(stmt, "min-elements"))
+    set_constraint(result[arg], "description", get_constraint(stmt, "description"))
 
     if hasattr(stmt, 'i_children'):
         for child in stmt.i_children:
             if child.keyword in producers:
                 logging.debug("keyword hit on: %s %s", child.keyword, child.arg)
-                if stmt.parent.keyword != "list":
-                    result[arg]["items"].append(producers[child.keyword](child))
-                else:
-                    result["properties"][arg]["items"].append(producers[child.keyword](child))
+                result[arg]["items"]["type"] = "object"
+                result[arg]["items"].setdefault("properties", {}).update(producers[child.keyword](child))
+                if child.search_one("mandatory") and child.search_one("mandatory").arg == "true":
+                    key = list(producers[child.keyword](child))[0]
+                    result[arg]["items"].setdefault("required", []).append(key)
             else:
                 logging.debug("keyword miss on: %s %s", child.keyword, child.arg)
     logging.debug("In produce_list for %s, returning %s", stmt.arg, result)
+
+    set_constraint(result[arg], "description", get_constraint(stmt, "description"))
+
     return result
 
 def produce_leaf_list(stmt):
@@ -181,35 +243,31 @@ def produce_leaf_list(stmt):
     type_stmt = stmt.search_one('type')
     type_id = type_stmt.arg
 
-    if types.is_base_type(type_id) or type_id in _other_type_trans_tbl:
-        type_str = produce_type(type_stmt)
-        result = {arg: {"type": "array", "items": [type_str]}}
-    else:
-        logging.debug("Missing mapping of base type: %s %s, type: %s",
-                      stmt.keyword, stmt.arg, type_id)
-        result = {arg: {"type": "array", "items": [{"type": "string"}]}}
+    result = {arg: {"type": "array", "items": produce_type(type_stmt)}}
+    set_constraint(result[arg], "maxItems", get_constraint(stmt, "max-elements"))
+    set_constraint(result[arg], "minItems", get_constraint(stmt, "min-elements"))
+    set_constraint(result[arg], "description", get_constraint(stmt, "description"))
     return result
 
 def produce_container(stmt):
     logging.debug("in produce_container: %s %s", stmt.keyword, stmt.arg)
     arg = qualify_name(stmt)
 
-    if stmt.parent.keyword != "list":
-        result = {arg: {"type": "object", "properties": {}}}
-    else:
-        result = {"type": "object", "properties": {arg:{"type": "object", "properties": {}}}}
+    result = {arg: {"type": "object", "properties": {}}}
 
     if hasattr(stmt, 'i_children'):
         for child in stmt.i_children:
             if child.keyword in producers:
                 logging.debug("keyword hit on: %s %s", child.keyword, child.arg)
-                if stmt.parent.keyword != "list":
-                    result[arg]["properties"].update(producers[child.keyword](child))
-                else:
-                    result["properties"][arg]["properties"].update(producers[child.keyword](child))
+                result[arg]["properties"].update(producers[child.keyword](child))
+                # NOTE we should find a way to set "required" for a choice as well
+                if child.keyword != "choice" and child.search_one("mandatory") and child.search_one("mandatory").arg == "true":
+                    key = list(producers[child.keyword](child))[0]
+                    result[arg].setdefault("required", []).append(key)
             else:
                 logging.debug("keyword miss on: %s %s", child.keyword, child.arg)
     logging.debug("In produce_container, returning %s", result)
+    set_constraint(result[arg], "description", get_constraint(stmt, "description"))
     return result
 
 def produce_choice(stmt):
@@ -263,55 +321,97 @@ def numeric_type_trans(dtype):
     trans_type = _numeric_type_trans_tbl[dtype][0]
     # Should include format string in return value
     # tformat = _numeric_type_trans_tbl[dtype][1]
-    return {"type": trans_type}
+    result = {"type": trans_type}
+    return result
 
 def string_trans(stmt):
     logging.debug("in string_trans with stmt %s %s", stmt.keyword, stmt.arg)
     result = {"type": "string"}
+    set_constraint(result, "description", get_constraint(stmt, "description"))
+    set_constraint(result, "pattern", get_constraint(stmt, "pattern"))
     return result
 
 def enumeration_trans(stmt):
     logging.debug("in enumeration_trans with stmt %s %s", stmt.keyword, stmt.arg)
-    result = {"properties": {"type": {"enum": []}}}
+    result = {"enum": []}
     for enum in stmt.search("enum"):
-        result["properties"]["type"]["enum"].append(enum.arg)
+        result["enum"].append(enum.arg)
     logging.debug("In enumeration_trans for %s, returning %s", stmt.arg, result)
+    set_constraint(result, "description", get_constraint(stmt, "description"))
     return result
 
 def bits_trans(stmt):
     logging.debug("in bits_trans with stmt %s %s", stmt.keyword, stmt.arg)
     result = {"type": "string"}
+    set_constraint(result, "description", get_constraint(stmt, "description"))
+    set_constraint(result, "pattern", get_constraint(stmt, "pattern"))
     return result
 
 def boolean_trans(stmt):
     logging.debug("in boolean_trans with stmt %s %s", stmt.keyword, stmt.arg)
     result = {"type": "boolean"}
+    set_constraint(result, "description", get_constraint(stmt, "description"))
     return result
 
 def empty_trans(stmt):
     logging.debug("in empty_trans with stmt %s %s", stmt.keyword, stmt.arg)
-    result = {"type": "array", "items": [{"type": "null"}]}
+    result = {"type": "array", "maxItems": 0}
+    set_constraint(result, "description", get_constraint(stmt, "description"))
     # Likely needs more/other work per:
     #  https://tools.ietf.org/html/draft-ietf-netmod-yang-json-10#section-6.9
     return result
 
 def union_trans(stmt):
     logging.debug("in union_trans with stmt %s %s", stmt.keyword, stmt.arg)
-    result = {"oneOf": []}
+    # NOTE use anyOf instead of oneOf, as sometimes values can overlap (e.g., just string type or with a simple pattern), which then prevents a oneOf from matching
+    result = {"anyOf": []}
     for member in stmt.search("type"):
         member_type = produce_type(member)
-        result["oneOf"].append(member_type)
+        for v in result["anyOf"]:
+            if v == member_type:
+                break
+        else:
+            result["anyOf"].append(member_type)
+    if len(result["anyOf"]) == 1:
+        return result["anyOf"][0]
     return result
 
 def instance_identifier_trans(stmt):
     logging.debug("in instance_identifier_trans with stmt %s %s", stmt.keyword, stmt.arg)
     result = {"type": "string"}
+    set_constraint(result, "description", get_constraint(stmt, "description"))
+    set_constraint(result, "pattern", get_constraint(stmt, "pattern"))
     return result
 
 def leafref_trans(stmt):
     logging.debug("in leafref_trans with stmt %s %s", stmt.keyword, stmt.arg)
-    # TODO: Need to resolve i_leafref_ptr here 
-    result = {"type": "string"}
+    path = stmt.search_one("path").arg
+    import re
+    path = re.sub("\\[.*?\\]", "", path)
+    current = stmt.parent
+    for p in path.split("/"):
+        if p == "..":
+            current = current.parent
+            while current.keyword in ["choice", "case"]:
+                # Choice node can be skipped
+                current = current.parent
+        else:
+            if "[" in p:
+                p = p.split("[")[0]
+            if current is None:
+                logging.warning("could not resolve path '%s': element '%s' not found; not generating schema for this" % (path, p))
+                return {}
+            for child in current.substmts:
+                if child.keyword in producers and child.arg == p:
+                    current = child
+                    break
+            else:
+                logging.warning("could not resolve path '%s': element '%s' not found; not generating schema for this" % (path, p))
+                return {}
+    produced = list(producers[current.keyword](current).values())[0]
+    result = produced
+    set_constraint(result, "description", get_constraint(stmt, "description"))
+    set_constraint(result, "pattern", get_constraint(stmt, "pattern"))
     return result
 
 _other_type_trans_tbl = {
@@ -344,3 +444,33 @@ def qualify_name(stmt):
         logging.debug("In qualify_name with: %s %s and parent is different", stmt.keyword, stmt.arg)
         return pfx + ":" + stmt.arg
     return stmt.arg
+
+def get_constraint(stmt, name):
+    val = stmt.search_one(name)
+    if val is not None:
+        return val.arg
+
+def set_constraint(struct, name, value, func=None):
+    if value is not None:
+        if func is not None:
+            value = func(value)
+
+        if name in ["maxItems", "minItems", "minLength", "maxLength", "minimum", "maximum"]:
+            # Integer values, so convert
+            struct[name] = int(value)
+        elif name == "pattern":
+            # Do some necessary patching first, to ensure that we have the whole value
+            struct[name] = "^(%s)$" % value
+        else:
+            # String values, so keep as-is
+            struct[name] = value
+
+def gen_num(inp):
+    if "." in inp:
+        return float(inp)
+    elif inp == "max":
+        return None
+    elif inp == "min":
+        return None
+    else:
+        return int(inp)
